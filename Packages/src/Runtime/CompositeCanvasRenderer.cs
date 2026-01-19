@@ -62,9 +62,18 @@ namespace CompositeCanvas
                  "Perspective: Use perspective space to bake.\n")]
         private ViewType m_ViewType = ViewType.Automatic;
 
+        // NOTE:
+        //  - Legacy extents (Vector2) expanded symmetrically (x: left+right, y: top+bottom).
+        //  - New extents (Vector4) expands each direction independently.
         [SerializeField]
-        [Tooltip("The value to expand the baking range.")]
-        private Vector2 m_Extents;
+        [HideInInspector]
+        [FormerlySerializedAs("m_Extents")]
+        private Vector2 m_ExtentsLegacy;
+
+        [SerializeField]
+        [Tooltip("The value to expand the baking range.\n" +
+                 "x: left, y: right, z: top, w: bottom")]
+        private Vector4 m_Extents;
 
         [SerializeField]
         [Tooltip("Ignore source graphics outside the baking region.")]
@@ -278,8 +287,9 @@ namespace CompositeCanvas
 
         /// <summary>
         /// The value to expand the baking range.
+        /// x: left, y: right, z: top, w: bottom
         /// </summary>
-        public Vector2 extents
+        public Vector4 extents
         {
             get => m_Extents;
             set
@@ -293,9 +303,21 @@ namespace CompositeCanvas
         }
 
         /// <summary>
+        /// Legacy helper: total extents (x: left+right, y: top+bottom).
+        /// </summary>
+        [Obsolete("Use extents (Vector4) instead.")]
+        public Vector2 extentsXY
+        {
+            get => new Vector2(m_Extents.x + m_Extents.y, m_Extents.z + m_Extents.w);
+            set => extents = new Vector4(value.x * 0.5f, value.x * 0.5f, value.y * 0.5f, value.y * 0.5f);
+        }
+
+        /// <summary>
         /// Rendering size.
         /// </summary>
-        public Vector2 renderingSize => rectTransform.rect.size + m_Extents;
+        public Vector2 renderingSize => rectTransform.rect.size + new Vector2(
+            m_Extents.x + m_Extents.y,
+            m_Extents.z + m_Extents.w);
 
         /// <summary>
         /// Show the source graphics.
@@ -493,6 +515,43 @@ namespace CompositeCanvas
 
         internal CommandBuffer cb => _cb ?? (_cb = s_CommandBufferPool.Rent());
 
+        private void MigrateLegacyExtentsIfNeeded()
+        {
+            // If this component was serialized with the old Vector2 extents,
+            // convert it to the new Vector4 (left/right/top/bottom) format.
+            if (m_Extents == Vector4.zero && m_ExtentsLegacy != Vector2.zero)
+            {
+                m_Extents = new Vector4(
+                    m_ExtentsLegacy.x * 0.5f,
+                    m_ExtentsLegacy.x * 0.5f,
+                    m_ExtentsLegacy.y * 0.5f,
+                    m_ExtentsLegacy.y * 0.5f);
+                m_ExtentsLegacy = Vector2.zero;
+            }
+        }
+
+        /// <summary>
+        /// Calculate clip-space offset so that the expanded rect (including extents) maps to [-1, 1]
+        /// without being clipped by pivot.
+        /// </summary>
+        private Vector2 GetBakeOffsetNormalized()
+        {
+            if (!rectTransform) return Vector2.zero;
+
+            var baseSize = rectTransform.rect.size;
+            var size = renderingSize;
+            if (size.x <= 0.0001f || size.y <= 0.0001f || baseSize.x <= 0.0001f || baseSize.y <= 0.0001f)
+            {
+                return rectTransform.pivot * 2 - Vector2.one;
+            }
+
+            var p = rectTransform.pivot;
+            // m_Extents: x=left, y=right, z=top, w=bottom
+            var tx = -1f + 2f * (m_Extents.x + baseSize.x * p.x) / size.x;
+            var ty = -1f + 2f * (m_Extents.w + baseSize.y * p.y) / size.y;
+            return new Vector2(tx, ty);
+        }
+
         /// <summary>
         /// This function is called when the object becomes enabled and active.
         /// </summary>
@@ -500,6 +559,7 @@ namespace CompositeCanvas
         {
             Profiler.BeginSample("(CCR)[CompositeCanvasRenderer] OnEnable > Base");
             base.OnEnable();
+            MigrateLegacyExtentsIfNeeded();
             Profiler.EndSample();
 
             Profiler.BeginSample("(CCR)[CompositeCanvasRenderer] OnEnable > Register callbacks");
@@ -620,10 +680,12 @@ namespace CompositeCanvas
         public Rect GetRenderingRect()
         {
             var r = GetPixelAdjustedRect();
-            return new Rect(r.x - m_Extents.x / 2,
-                r.y - m_Extents.y / 2,
-                r.width + m_Extents.x,
-                r.height + m_Extents.y);
+            // m_Extents: x=left, y=right, z=top, w=bottom
+            return new Rect(
+                r.x - m_Extents.x,
+                r.y - m_Extents.w,
+                r.width + m_Extents.x + m_Extents.y,
+                r.height + m_Extents.z + m_Extents.w);
         }
 
         /// <summary>
@@ -888,9 +950,13 @@ namespace CompositeCanvas
                 var viewport = canvas.rootCanvas.transform as RectTransform;
                 var bounds = viewport.GetRelativeBounds(transform);
                 var viewportRect = viewport.rect;
-                var ex = extents;
+                var ex = extents; // x=left, y=right, z=top, w=bottom
                 var rect = new Rect(bounds.min, bounds.size);
-                rect.Set(rect.xMin - ex.x / 2, rect.yMin - ex.y / 2, rect.width + ex.x, rect.height + ex.y);
+                rect.Set(
+                    rect.xMin - ex.x,
+                    rect.yMin - ex.w,
+                    rect.width + ex.x + ex.y,
+                    rect.height + ex.z + ex.w);
                 result = viewportRect.Overlaps(rect, true);
             }
 
@@ -969,7 +1035,7 @@ namespace CompositeCanvas
 
                 // L2W matrix from rootCanvas to this.
                 var relative = rootRt.worldToLocalMatrix * transform.localToWorldMatrix;
-                var pivot = rectTransform.pivot * 2 - Vector2.one;
+                var offset = GetBakeOffsetNormalized();
 
                 // Perspective mode.
                 if (perspectiveBaking)
@@ -977,7 +1043,7 @@ namespace CompositeCanvas
                     GetViewProjectionMatrix(rootCanvas, out var viewMatrix, out var projectionMatrix);
 
                     var t = relative.MultiplyPoint3x4(Vector3.zero).GetScaled(-new Vector3(2, 2, 1), size.Inverse());
-                    t += (Vector3)pivot;
+                    t += (Vector3)offset;
                     var s = rootSize.GetScaled(size.Inverse());
                     var m22 = projectionMatrix.m22;
                     var m23 = projectionMatrix.m23;
@@ -991,7 +1057,7 @@ namespace CompositeCanvas
                 {
                     var viewMatrix = Matrix4x4.identity;
                     var projectionMatrix = Matrix4x4.TRS(
-                        new Vector3(pivot.x, pivot.y, 0),
+                        new Vector3(offset.x, offset.y, 0),
                         Quaternion.identity,
                         new Vector3(2 / size.x, 2 / size.y, -2 / 10000f));
                     _cb.SetViewProjectionMatrices(viewMatrix, projectionMatrix);
@@ -1139,6 +1205,7 @@ namespace CompositeCanvas
         protected override void OnValidate()
         {
             blendType = blendType;
+            MigrateLegacyExtentsIfNeeded();
             SetDirty(false);
             SetVerticesDirty();
             SetMaterialDirty();
@@ -1152,23 +1219,22 @@ namespace CompositeCanvas
             if (!isActiveAndEnabled || !canvas) return;
 
             Vector3 center, size;
+            var rr = GetRenderingRect();
             if (perspectiveBaking)
             {
                 var rootCanvas = canvas.rootCanvas.transform;
                 var relative = rootCanvas.worldToLocalMatrix * transform.localToWorldMatrix;
-                var pos = relative.MultiplyPoint3x4(Vector3.zero);
-                pos.z = 0;
-
-                var pivot = rectTransform.pivot - new Vector2(0.5f, 0.5f);
-                size = ((Vector3)renderingSize).GetScaled(relative.lossyScale);
-                center = pos - size.GetScaled(pivot);
+                // Use the expanded rendering rect so gizmos match the actual bake area.
+                center = relative.MultiplyPoint3x4(new Vector3(rr.center.x, rr.center.y, 0));
+                center.z = 0;
+                size = new Vector3(rr.width, rr.height, 0).GetScaled(relative.lossyScale);
                 Gizmos.matrix = rootCanvas.localToWorldMatrix;
             }
             else
             {
-                var pivot = rectTransform.pivot - new Vector2(0.5f, 0.5f);
-                size = renderingSize;
-                center = -size.GetScaled(pivot);
+                // Use the expanded rendering rect so gizmos match the actual bake area.
+                center = new Vector3(rr.center.x, rr.center.y, 0);
+                size = new Vector3(rr.width, rr.height, 0);
                 Gizmos.matrix = transform.localToWorldMatrix;
             }
 
